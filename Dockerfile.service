@@ -1,0 +1,46 @@
+# Polaris Docker Service — Express + WebSocket server (Railway).
+# Build: docker build -f Dockerfile.service -t polaris-docker-service .
+
+# -----------------------------------------------------------------------------
+# Stage 1: Build TypeScript and produce dist/ (node-pty needs Python + build tools)
+# -----------------------------------------------------------------------------
+FROM node:20-alpine AS builder
+WORKDIR /app
+# node-pty is a native addon; node-gyp needs Python and build tools to compile.
+RUN apk add --no-cache python3 make g++
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npm run build
+# Keep only production deps so we can copy node_modules into final image.
+RUN npm prune --production
+
+# -----------------------------------------------------------------------------
+# Stage 2: Production image — runtime only, minimal deps
+# -----------------------------------------------------------------------------
+FROM node:20-alpine
+
+# Docker CLI so the service can talk to the host Docker socket (e.g. on Railway).
+RUN apk add --no-cache docker-cli
+
+WORKDIR /app
+COPY package*.json ./
+# Use builder’s node_modules (node-pty already built); avoid rebuilding in production.
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+
+# Non-root user for running the Node process.
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Allow appuser to access Docker socket (group name must match host’s docker group).
+RUN addgroup -S docker || true \
+  && adduser appuser docker || true
+
+USER appuser
+EXPOSE 4000
+
+ENV NODE_ENV=production
+ENV PORT=4000
+
+CMD ["node", "dist/server.js"]
