@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+</head>
+<body>
+  <div id="terminal"></div>
+  <button onclick="startSession()">Start Session</button>
+  <script>
+    const term = new Terminal();
+    term.open(document.getElementById('terminal'));
+    let ws;
+
+    async function startSession() {
+      // 1. Start a session
+      const res = await fetch('http://localhost:4000/session/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-internal-key': 'test-key-change-this'
+        },
+        body: JSON.stringify({
+          sessionId: 'test-' + Date.now(),
+          projectId: 'proj-1',
+          userId: 'user-1',
+          files: [
+            { path: 'index.js', content: 'console.log("hello from polaris")' }
+          ]
+        })
+      });
+
+      const { sessionId, wsUrl } = await res.json();
+      console.log('Session started:', sessionId);
+
+      // 2. Connect terminal WebSocket
+      ws = new WebSocket(wsUrl.replace('wss://', 'ws://'));
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'connected') console.log('Terminal connected!');
+          if (msg.type === 'error') console.error(msg.message);
+        } catch {
+          term.write(e.data);
+        }
+      };
+
+      // 3. Wire xterm input → WebSocket
+      term.onData(data => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'input', data }));
+        }
+      });
+    }
+  </script>
+</body>
+</html>
