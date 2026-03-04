@@ -1,0 +1,43 @@
+{
+  "name": "polaris-docker-service",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+  "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+  "build": "tsc",
+  "start": "node dist/server.js",
+  "lint": "tsc --noEmit"
+},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdkulkarni2005/polaris-docker-service.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/mdkulkarni2005/polaris-docker-service/issues"
+  },
+  "homepage": "https://github.com/mdkulkarni2005/polaris-docker-service#readme",
+  "dependencies": {
+    "@clerk/backend": "^3.0.1",
+    "cors": "^2.8.6",
+    "dockerode": "^4.0.9",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "http-proxy-middleware": "^3.0.5",
+    "node-pty": "^1.1.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/dockerode": "^4.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.3.3",
+    "@types/ws": "^8.18.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  }
+}

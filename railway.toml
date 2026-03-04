@@ -1,0 +1,7 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile.service"
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "always"
