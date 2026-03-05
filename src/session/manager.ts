@@ -7,12 +7,112 @@ import type { SessionInfo } from './registry';
 
 const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE ?? 'mdkulkanri20/polaris-sandbox:latest';
 const MAX_SESSIONS = Math.max(1, parseInt(process.env.MAX_SESSIONS ?? '10', 10));
+const MAX_SESSIONS_PER_USER = Math.max(
+  1,
+  parseInt(process.env.MAX_SESSIONS_PER_USER ?? '3', 10)
+);
 
 const PORT_START = 3100;
 const PORT_END = 3200;
 const usedPorts = new Set<number>();
 
 const docker = new Docker();
+
+async function autoStartDevServer(
+  containerId: string,
+  sessionId: string
+): Promise<void> {
+  console.log(
+    `[polaris-docker] === AUTO START CALLED: ${sessionId} for container ${containerId} ===`
+  );
+
+  const container = docker.getContainer(containerId);
+  const baseCommand =
+    process.env.POLARIS_DEV_COMMAND ??
+    'npm run dev -- --host 0.0.0.0 --port 5173';
+  const fullCommand = `cd /workspace 2>/dev/null || true; nohup sh -c "npm install && ${baseCommand}" > /tmp/dev.log 2>&1 & echo $! > /tmp/dev.pid`;
+
+  console.log(
+    '[polaris-docker] auto-start dev server workingDir:',
+    '/workspace'
+  );
+  console.log(
+    '[polaris-docker] auto-start dev server command:',
+    fullCommand
+  );
+
+  try {
+    const exec = await container.exec({
+      AttachStdout: true,
+      AttachStderr: true,
+      AttachStdin: false,
+      Tty: false,
+      User: 'sandbox',
+      WorkingDir: '/workspace',
+      Cmd: ['/bin/bash', '-lc', fullCommand],
+    });
+
+    const stream = await exec.start({ hijack: true, stdin: false });
+
+    if (!stream) {
+      console.error(
+        '[polaris-docker] auto-start exec stream not available',
+        { sessionId, containerId }
+      );
+      return;
+    }
+
+    let output = '';
+    stream.on('data', (chunk: Buffer | string) => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+      output += text;
+    });
+
+    stream.on('end', async () => {
+      try {
+        const inspect = await exec.inspect();
+        const exitCode = (inspect as { ExitCode?: number }).ExitCode ?? null;
+        if (exitCode === 0) {
+          console.log(
+            '[polaris-docker] auto-start exec completed successfully',
+            { sessionId, containerId }
+          );
+        } else {
+          console.error(
+            '[polaris-docker] auto-start exec exited with non-zero code',
+            { sessionId, containerId, exitCode, output }
+          );
+        }
+      } catch (err) {
+        console.error(
+          '[polaris-docker] auto-start exec inspect failed',
+          {
+            sessionId,
+            containerId,
+            error: err instanceof Error ? err.message : String(err),
+          }
+        );
+      }
+    });
+
+    stream.on('error', (err: Error) => {
+      console.error(
+        '[polaris-docker] auto-start exec stream error',
+        { sessionId, containerId, error: err.message }
+      );
+    });
+  } catch (err) {
+    console.error(
+      '[polaris-docker] auto-start dev server failed',
+      {
+        sessionId,
+        containerId,
+        error: err instanceof Error ? err.message : String(err),
+      }
+    );
+    throw err;
+  }
+}
 
 export async function cleanupOrphanContainers(): Promise<void> {
   try {
@@ -137,7 +237,7 @@ export class SessionManager {
   async createSession(params: CreateSessionParams): Promise<CreateSessionResult> {
     const { sessionId, projectId, userId, files } = params;
 
-    const existing = registry.findByProjectId(projectId);
+    const existing = registry.findByProjectId(projectId, userId);
     if (existing) {
       if (existing.info.status === 'running') {
         registry.updateActivity(existing.sessionId);
@@ -164,6 +264,11 @@ export class SessionManager {
           reused: true,
         };
       }
+    }
+
+    const userSessions = registry.countByUser(userId);
+    if (userSessions >= MAX_SESSIONS_PER_USER) {
+      throw new Error('Per-user session limit reached');
     }
 
     if (registry.count() >= MAX_SESSIONS) {
@@ -258,8 +363,20 @@ export class SessionManager {
           container = await docker.createContainer(containerConfig);
 
           await container.start();
-
           const containerId = container.id;
+
+          console.log(
+            '[polaris-docker] container started, launching auto-start:',
+            sessionId
+          );
+          autoStartDevServer(containerId, sessionId).catch((err: unknown) => {
+            console.error(
+              '[polaris-docker] TOP LEVEL auto-start error:',
+              sessionId,
+              err
+            );
+          });
+
           const now = new Date();
           const info: SessionInfo = {
             containerId,
@@ -302,6 +419,17 @@ export class SessionManager {
     if (!info) throw new Error(`[polaris-docker] session not found: ${sessionId}`);
     const container = docker.getContainer(info.containerId);
     await container.start();
+    console.log(
+      '[polaris-docker] container started, launching auto-start (restart):',
+      sessionId
+    );
+    autoStartDevServer(info.containerId, sessionId).catch((err: unknown) => {
+      console.error(
+        '[polaris-docker] TOP LEVEL auto-start error (restart):',
+        sessionId,
+        err
+      );
+    });
     registry.updateStatus(sessionId, 'running');
     registry.updateActivity(sessionId);
     console.log('[polaris-docker] restarted container', { sessionId });
