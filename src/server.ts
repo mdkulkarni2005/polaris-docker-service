@@ -128,6 +128,94 @@ app.get('/session/status', hybridAuth, (req, res) => {
   res.status(200).json(sessionManager.getStatus(sessionId));
 });
 
+app.get('/session/devlog', hybridAuth, async (req, res) => {
+  const sessionId = req.query.sessionId as string | undefined;
+  if (!sessionId) {
+    res.status(400).json({ error: 'Missing sessionId query' });
+    return;
+  }
+
+  const session = registry.get(sessionId);
+  if (!session) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const containerId = session.containerId;
+  const container = docker.getContainer(containerId);
+
+  const execInContainer = async (cmd: string): Promise<{ output: string; error?: string }> => {
+    try {
+      const exec = await container.exec({
+        AttachStdout: true,
+        AttachStderr: true,
+        AttachStdin: false,
+        Tty: false,
+        User: 'sandbox',
+        WorkingDir: '/workspace',
+        Cmd: ['/bin/bash', '-lc', cmd],
+      });
+      const stream = await exec.start({ hijack: true, stdin: false });
+      if (!stream) {
+        return { output: '', error: 'Failed to start exec' };
+      }
+      let output = '';
+      stream.on('data', (chunk: Buffer | string) => {
+        const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+        output += text;
+      });
+      await new Promise<void>((resolve, reject) => {
+        stream.on('end', () => resolve());
+        stream.on('error', (err: Error) => reject(err));
+      });
+      return { output };
+    } catch (err) {
+      return {
+        output: '',
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+
+  try {
+    const devLogResult = await execInContainer(
+      'if [ -f /tmp/dev.log ]; then cat /tmp/dev.log; else echo "dev.log not found"; fi'
+    );
+    const psResult = await execInContainer('ps aux');
+
+    if (devLogResult.error || psResult.error) {
+      console.error('[polaris-docker] /session/devlog exec error', {
+        sessionId,
+        containerId,
+        devLogError: devLogResult.error,
+        processesError: psResult.error,
+      });
+      res.status(500).json({
+        error: 'Failed to execute debug commands in container',
+        devLogError: devLogResult.error,
+        processesError: psResult.error,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      sessionId,
+      containerId,
+      devLog: devLogResult.output,
+      processes: psResult.output,
+    });
+  } catch (err) {
+    console.error('[polaris-docker] /session/devlog unexpected error', {
+      sessionId,
+      containerId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    res.status(500).json({
+      error: 'Unexpected error while collecting dev logs',
+    });
+  }
+});
+
 app.get('/health', (_req, res) => {
   res.status(200).json({ status: 'ok', ...getStats(), uptime: process.uptime() });
 });
