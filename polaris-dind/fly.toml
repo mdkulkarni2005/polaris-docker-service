@@ -1,0 +1,18 @@
+app = "polaris-docker-dind"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DOCKER_TLS_CERTDIR = ""
+
+[[services]]
+  internal_port = 2375
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 2375
+
+[experimental]
+  privileged = true

@@ -69,3 +69,16 @@ export const hybridAuth: RequestHandler = (req, res, next) => {
   }
   clerkAuth(req, res, next);
 };
+
+/** Reject only when key is present and wrong. Use for WebSocket upgrade and preview. */
+export function isInternalKeyInvalid(
+  headers: { [key: string]: string | string[] | undefined },
+  queryKey: string | null
+): boolean {
+  const expected = process.env.DOCKER_SERVICE_INTERNAL_KEY;
+  if (!expected) return false;
+  const headerKey = headers['x-internal-key'];
+  const key = typeof headerKey === 'string' ? headerKey : queryKey;
+  if (!key) return false; // no key sent → allow
+  return key !== expected;
+}

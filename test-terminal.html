@@ -12,43 +12,80 @@
     term.open(document.getElementById('terminal'));
     let ws;
 
+    // Local dev: must match .env DOCKER_SERVICE_INTERNAL_KEY (use placeholder in repo, paste from .env for testing)
+    const INTERNAL_KEY = 'ca5883d7c45be6b3970e5fec9f1e11ef163b991895b186615f31f3210008ce21';
+    const API_BASE = 'http://localhost:4000';
+
     async function startSession() {
-      // 1. Start a session
-      const res = await fetch('http://localhost:4000/session/start', {
+      // 1. Start a session (same payload as Test 1 — files land in /workspace)
+      const res = await fetch(API_BASE + '/session/start', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-internal-key': 'test-key-change-this'
+          'x-internal-key': INTERNAL_KEY
         },
         body: JSON.stringify({
-          sessionId: 'test-' + Date.now(),
-          projectId: 'proj-1',
+          sessionId: 'file-test-001',
+          projectId: 'proj-file-test',
           userId: 'user-1',
           files: [
-            { path: 'index.js', content: 'console.log("hello from polaris")' }
+            { path: 'index.js', content: 'console.log("files work!")' },
+            { path: 'src/app.js', content: 'console.log("nested file works!")' }
           ]
         })
       });
 
-      const { sessionId, wsUrl } = await res.json();
-      console.log('Session started:', sessionId);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        console.error('Session start failed:', err);
+        term.write('\r\nSession start failed: ' + (err.error || err.message || res.status) + '\r\n');
+        return;
+      }
+      const data = await res.json();
+      const { sessionId, wsUrl, reused } = data;
+      console.log('Session started:', sessionId, reused ? '(reused)' : '(new)');
 
-      // 2. Connect terminal WebSocket
-      ws = new WebSocket(wsUrl.replace('wss://', 'ws://'));
+      // 2. Connect terminal WebSocket (append key as query so server can allow; browser cannot send custom headers)
+      const wsTarget = wsUrl.replace('wss://', 'ws://');
+      const wsWithKey = INTERNAL_KEY ? wsTarget + (wsTarget.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(INTERNAL_KEY) : wsTarget;
+      ws = new WebSocket(wsWithKey);
+      ws.onopen = () => {
+        term.write('\r\n[Terminal WebSocket open]\r\n');
+        // Send initial resize so container TTY has valid dimensions (avoids shell/stream closing)
+        const cols = term.cols || 80;
+        const rows = term.rows || 24;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+        }
+      };
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === 'connected') console.log('Terminal connected!');
-          if (msg.type === 'error') console.error(msg.message);
+          if (msg.type === 'connected') term.write('\r\n[Terminal connected to container]\r\n');
+          else if (msg.type === 'error') term.write('\r\n[Error] ' + (msg.message || '') + '\r\n');
+          else term.write(e.data);
         } catch {
           term.write(e.data);
         }
       };
+      ws.onerror = (err) => {
+        term.write('\r\n[Terminal WebSocket error – check console]\r\n');
+        console.error('Terminal WebSocket error:', err);
+      };
+      ws.onclose = (e) => {
+        term.write('\r\n[Terminal closed] code=' + e.code + (e.reason ? ' reason=' + e.reason : '') + '\r\n');
+        console.warn('Terminal WebSocket closed:', e.code, e.reason);
+      };
 
-      // 3. Wire xterm input → WebSocket
+      // 3. Wire xterm input and resize → WebSocket
       term.onData(data => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'input', data }));
+        }
+      });
+      term.onResize(({ cols, rows }) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'resize', cols, rows }));
         }
       });
     }

@@ -1,0 +1,13 @@
+# Copy everything below this line into your Polaris repo as .env.local
+# (Create the file if it doesn't exist.)
+# ---------------------------------------------------------------------
+# LOCAL SETUP — polaris-docker-service running on your machine (e.g. npm run dev on port 4000)
+
+# Docker service URL — local (no trailing slash)
+DOCKER_SERVICE_URL=http://localhost:4000
+
+# Must match the value in polaris-docker-service .env (copy from there)
+DOCKER_SERVICE_INTERNAL_KEY=paste_same_value_from_polaris_docker_service_env
+
+# Preview provider: "webcontainer" (default) or "docker"
+NEXT_PUBLIC_PREVIEW_PROVIDER=webcontainer

@@ -4,10 +4,10 @@ import { createServer } from 'http';
 import ws from 'ws';
 import cors from 'cors';
 import Docker from 'dockerode';
-import { sessionManager } from './session/manager';
+import { cleanupOrphanContainers, sessionManager } from './session/manager';
 import { registry } from './session/registry';
-import { hybridAuth } from './security/auth';
-import { checkSessionLimit, startWatchdog, stopWatchdog, getStats } from './security/limits';
+import { hybridAuth, isInternalKeyInvalid } from './security/auth';
+import { startWatchdog, stopWatchdog, getStats } from './security/limits';
 import { attachTerminal } from './terminal/pty';
 import { createPreviewRouter } from './proxy/preview';
 
@@ -18,6 +18,13 @@ const PORT = Number(process.env.PORT) || 4000;
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    res.status(400).json({ error: 'Invalid JSON' });
+    return;
+  }
+  next(err);
+});
 app.use(createPreviewRouter());
 
 const server = createServer(app);
@@ -25,9 +32,15 @@ const server = createServer(app);
 const wss = new ws.Server({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url!, `http://${req.headers.host}`);
+  const url = new URL(req.url!, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+  const queryKey = url.searchParams.get('key');
   const match = pathname.match(/^\/terminal\/(.+)$/);
   if (!match) {
+    socket.destroy();
+    return;
+  }
+  if (isInternalKeyInvalid(req.headers, queryKey)) {
     socket.destroy();
     return;
   }
@@ -63,25 +76,29 @@ app.post('/session/start', hybridAuth, async (req, res) => {
       res.status(400).json({ error: 'Missing or invalid sessionId, projectId, userId, or files' });
       return;
     }
-    if (checkSessionLimit()) {
+    const result = await sessionManager.createSession({ sessionId, projectId, userId, files });
+    const effectiveSessionId = result.sessionId;
+    const host = req.headers.host ?? `localhost:${PORT}`;
+    const isHttps = req.headers['x-forwarded-proto'] === 'https';
+    const wsProtocol = isHttps ? 'wss' : 'ws';
+    const httpProtocol = isHttps ? 'https' : 'http';
+    const wsUrl = `${wsProtocol}://${host}/terminal/${effectiveSessionId}`;
+    const previewUrl = `${httpProtocol}://${host}/preview/${effectiveSessionId}`;
+    res.status(200).json({
+      sessionId: effectiveSessionId,
+      wsUrl,
+      previewUrl,
+      reused: result.reused ?? false,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    console.log('[polaris-docker] session start error', { err });
+    if (message === 'Max sessions reached') {
       return res.status(429).json({
         error: 'Max sessions reached. Try again later.',
         maxSessions: parseInt(process.env.MAX_SESSIONS ?? '10', 10),
       });
     }
-    await sessionManager.createSession({ sessionId, projectId, userId, files });
-    const host = req.headers.host ?? `localhost:${PORT}`;
-    const wsProtocol = req.headers['x-forwarded-proto'] === 'https' ? 'wss' : 'ws';
-    const wsUrl = `${wsProtocol}://${host}/terminal/${sessionId}`;
-    const previewUrl = `https://${host}/preview/${sessionId}`;
-    res.status(200).json({
-      sessionId,
-      wsUrl,
-      previewUrl,
-    });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Unknown error';
-    console.log('[polaris-docker] session start error', { err });
     res.status(500).json({ error: message });
   }
 });
@@ -122,13 +139,15 @@ app.get('/sessions', hybridAuth, (_req, res) => {
     projectId: info.projectId,
     userId: info.userId,
     port: info.port,
+    status: info.status,
     startedAt: info.startedAt,
     lastActivity: info.lastActivity,
   }));
   res.status(200).json(sessions);
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
+  await cleanupOrphanContainers();
   const watchdogHandle = startWatchdog();
   console.log('[polaris-docker] running on', PORT);
   console.log('[polaris-docker] watchdog started');
