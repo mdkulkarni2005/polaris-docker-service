@@ -7,6 +7,10 @@ import type { SessionInfo } from './registry';
 
 const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE ?? 'mdkulkanri20/polaris-sandbox:latest';
 const MAX_SESSIONS = Math.max(1, parseInt(process.env.MAX_SESSIONS ?? '10', 10));
+const MAX_SESSIONS_PER_USER = Math.max(
+  1,
+  parseInt(process.env.MAX_SESSIONS_PER_USER ?? '3', 10)
+);
 
 const PORT_START = 3100;
 const PORT_END = 3200;
@@ -233,7 +237,7 @@ export class SessionManager {
   async createSession(params: CreateSessionParams): Promise<CreateSessionResult> {
     const { sessionId, projectId, userId, files } = params;
 
-    const existing = registry.findByProjectId(projectId);
+    const existing = registry.findByProjectId(projectId, userId);
     if (existing) {
       if (existing.info.status === 'running') {
         registry.updateActivity(existing.sessionId);
@@ -260,6 +264,11 @@ export class SessionManager {
           reused: true,
         };
       }
+    }
+
+    const userSessions = registry.countByUser(userId);
+    if (userSessions >= MAX_SESSIONS_PER_USER) {
+      throw new Error('Per-user session limit reached');
     }
 
     if (registry.count() >= MAX_SESSIONS) {

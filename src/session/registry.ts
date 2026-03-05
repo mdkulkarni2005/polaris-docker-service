@@ -56,9 +56,26 @@ export class SessionRegistry {
     }
   }
 
-  findByProjectId(projectId: string): { sessionId: string; info: SessionInfo } | undefined {
+  countByUser(userId: string): number {
+    let count = 0;
+    for (const info of this.sessions.values()) {
+      if (info.userId === userId && info.status !== 'deleted') {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  findByProjectId(
+    projectId: string,
+    userId?: string
+  ): { sessionId: string; info: SessionInfo } | undefined {
     for (const [sessionId, info] of this.sessions) {
-      if (info.projectId === projectId && info.status !== 'deleted') {
+      if (
+        info.projectId === projectId &&
+        info.status !== 'deleted' &&
+        (userId == null || info.userId === userId)
+      ) {
         return { sessionId, info };
       }
     }

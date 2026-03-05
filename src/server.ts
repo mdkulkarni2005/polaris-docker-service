@@ -99,6 +99,15 @@ app.post('/session/start', hybridAuth, async (req, res) => {
         maxSessions: parseInt(process.env.MAX_SESSIONS ?? '10', 10),
       });
     }
+    if (message === 'Per-user session limit reached') {
+      return res.status(429).json({
+        error: 'Per-user session limit reached. Close an existing preview and try again.',
+        maxSessionsPerUser: parseInt(
+          process.env.MAX_SESSIONS_PER_USER ?? '3',
+          10
+        ),
+      });
+    }
     res.status(500).json({ error: message });
   }
 });
