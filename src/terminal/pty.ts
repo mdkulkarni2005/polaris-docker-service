@@ -13,7 +13,11 @@ interface InputMessage {
   data: string;
 }
 
-type ClientMessage = ResizeMessage | InputMessage;
+interface RestartDevMessage {
+  type: 'restartDev';
+}
+
+type ClientMessage = ResizeMessage | InputMessage | RestartDevMessage;
 
 export async function attachTerminal(
   ws: WebSocket,
@@ -34,7 +38,9 @@ export async function attachTerminal(
       AttachStdout: true,
       AttachStderr: true,
       Tty: true,
-      Cmd: ['/bin/bash'],
+      User: 'root',
+      WorkingDir: '/workspace',
+      Cmd: ['/bin/bash', '-c', 'cd /workspace 2>/dev/null || true; exec /bin/bash -i'],
     });
 
     const execStream = await exec.start({ hijack: true, stdin: true });
@@ -44,18 +50,43 @@ export async function attachTerminal(
       return;
     }
 
-    ws.send(JSON.stringify({ type: 'connected', sessionId }));
     console.log('[polaris-docker] terminal connected:', sessionId);
 
+    // Auto-bootstrap: run npm install + dev server once terminal attaches.
+    execStream.write(
+      'npm install && npm run dev -- --host 0.0.0.0 --port 5173\n'
+    );
+
     execStream.on('data', (chunk: Buffer | string) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(typeof chunk === 'string' ? chunk : chunk.toString());
+      if (ws.readyState !== ws.OPEN) {
+        return;
       }
+      const raw = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+      const cleaned = raw
+        .replace(/\r/g, '')
+        .replace(/[⠙⠹⠸⠼⠴⠦⠧⠇⠏⠋]/g, '');
+      if (cleaned.length === 0) return;
+      ws.send(cleaned);
     });
 
-    execStream.on('end', () => {
-      console.log('[polaris-docker] terminal exec stream ended:', sessionId);
-      ws.close();
+    execStream.on('end', async () => {
+      console.log(
+        '[polaris-docker] terminal exec stream ended (server closing ws):',
+        sessionId
+      );
+      try {
+        const inspect = await exec.inspect();
+        const exitCode = (inspect as { ExitCode?: number }).ExitCode;
+        const msg = `\r\n[polaris-docker] dev server exited with code ${
+          exitCode ?? 'unknown'
+        }\r\n`;
+        if (ws.readyState === ws.OPEN) {
+          ws.send(msg);
+        }
+      } catch {
+        // ignore inspect errors
+      }
+      if (ws.readyState === ws.OPEN) ws.close();
     });
 
     execStream.on('error', (err: Error) => {
@@ -84,13 +115,20 @@ export async function attachTerminal(
         }
       } else if (parsed.type === 'input') {
         execStream.write(parsed.data);
+      } else if (parsed.type === 'restartDev') {
+        // Send Ctrl+C to stop current dev server, then restart it.
+        execStream.write('\x03');
+        execStream.write(
+          'npm run dev -- --host 0.0.0.0 --port 5173\n'
+        );
       } else {
         execStream.write(msg);
       }
     });
 
-    ws.on('close', () => {
-      console.log('[polaris-docker] terminal client closed:', sessionId);
+    ws.on('close', (code: number, reason: Buffer) => {
+      const reasonStr = reason?.length ? reason.toString() : '';
+      console.log('[polaris-docker] terminal client closed:', sessionId, { code, reason: reasonStr || undefined });
       execStream.destroy();
     });
   } catch (err) {

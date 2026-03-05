@@ -4,11 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-  "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-  "build": "tsc",
-  "start": "node dist/server.js",
-  "lint": "tsc --noEmit"
-},
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "lint": "tsc --noEmit",
+    "free-port": "lsof -i :4000 -t 2>/dev/null | xargs kill -9 2>/dev/null; echo 'Port 4000 freed'"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mdkulkarni2005/polaris-docker-service.git"

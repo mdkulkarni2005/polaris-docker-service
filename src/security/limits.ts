@@ -2,8 +2,8 @@ import { registry } from '../session/registry';
 import { sessionManager } from '../session/manager';
 
 const MAX_SESSIONS = Math.max(1, parseInt(process.env.MAX_SESSIONS ?? '10', 10));
-const SESSION_TIMEOUT_MS =
-  Math.max(60_000, parseInt(process.env.SESSION_TIMEOUT_MINUTES ?? '30', 10) * 60 * 1000);
+const IDLE_STOP_MS = 60 * 60 * 1000; // 1 hour — stop container, keep in registry
+const IDLE_DELETE_MS = 24 * 60 * 60 * 1000; // 24 hours — full teardown
 const WATCHDOG_INTERVAL_MS = 60_000;
 
 export function checkSessionLimit(): boolean {
@@ -16,16 +16,22 @@ export function checkSessionLimit(): boolean {
 
 export function startWatchdog(): NodeJS.Timeout {
   const handle = setInterval(() => {
-    const toStop: string[] = [];
+    const toDelete: string[] = [];
+    const toStopIdle: string[] = [];
     for (const [sessionId, session] of registry.getAll()) {
       const idleMs = Date.now() - session.lastActivity.getTime();
-      if (idleMs > SESSION_TIMEOUT_MS) {
-        toStop.push(sessionId);
+      if (idleMs > IDLE_DELETE_MS) {
+        toDelete.push(sessionId);
+      } else if (session.status === 'running' && idleMs > IDLE_STOP_MS) {
+        toStopIdle.push(sessionId);
       }
     }
-    for (const sessionId of toStop) {
-      console.log('[polaris-docker] auto-killing idle session:', sessionId);
+    for (const sessionId of toDelete) {
+      console.log('[polaris-docker] deleting expired container:', sessionId);
       sessionManager.stopSession(sessionId).catch(() => {});
+    }
+    for (const sessionId of toStopIdle) {
+      sessionManager.stopContainerIdle(sessionId).catch(() => {});
     }
   }, WATCHDOG_INTERVAL_MS);
   return handle;
