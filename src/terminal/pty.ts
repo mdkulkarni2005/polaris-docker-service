@@ -1,6 +1,7 @@
 import type WebSocket from 'ws';
 import type Docker from 'dockerode';
 import { registry } from '../session/registry';
+import { unpauseSession } from '../session/manager';
 
 interface ResizeMessage {
   type: 'resize';
@@ -31,6 +32,12 @@ export async function attachTerminal(
     return;
   }
 
+  if (session.status === 'paused') {
+    console.log(`[polaris-docker] auto-unpausing for request: ${sessionId}`);
+    await unpauseSession(sessionId);
+    await new Promise(r => setTimeout(r, 300));
+  }
+
   try {
     const container = docker.getContainer(session.containerId);
     const exec = await container.exec({
@@ -40,7 +47,7 @@ export async function attachTerminal(
       Tty: true,
       User: 'root',
       WorkingDir: '/workspace',
-      Cmd: ['/bin/bash', '-c', 'cd /workspace 2>/dev/null || true; exec /bin/bash -i'],
+      Cmd: ['/bin/sh', '-c', 'cd /workspace 2>/dev/null || true; if [ -f .polaris-start.sh ]; then sh .polaris-start.sh; rm -f .polaris-start.sh; fi; exec /bin/sh -i'],
     });
 
     const execStream = await exec.start({ hijack: true, stdin: true });
@@ -51,11 +58,6 @@ export async function attachTerminal(
     }
 
     console.log('[polaris-docker] terminal connected:', sessionId);
-
-    // Auto-bootstrap: run npm install + dev server once terminal attaches.
-    execStream.write(
-      'npm install && npm run dev -- --host 0.0.0.0 --port 5173\n'
-    );
 
     execStream.on('data', (chunk: Buffer | string) => {
       if (ws.readyState !== ws.OPEN) {

@@ -1,9 +1,14 @@
 import Docker from 'dockerode';
-import { mkdir, writeFile, rm, chmod, readdir } from 'fs/promises';
+import { mkdir, writeFile, rm, chmod } from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { registry } from './registry';
 import type { SessionInfo } from './registry';
+import { detectProject } from '../detection';
+import { selectImage } from '../images/imageSelector';
+import { containerPool, sessionLabels } from '../pool/containerPool';
+import { redis } from '../lib/redis';
+import { getAvailablePort, reservePort, releasePort } from '../ports';
 
 const SANDBOX_IMAGE = process.env.SANDBOX_IMAGE ?? 'mdkulkanri20/polaris-sandbox:latest';
 const MAX_SESSIONS = Math.max(1, parseInt(process.env.MAX_SESSIONS ?? '10', 10));
@@ -12,123 +17,163 @@ const MAX_SESSIONS_PER_USER = Math.max(
   parseInt(process.env.MAX_SESSIONS_PER_USER ?? '3', 10)
 );
 
-const PORT_START = 3100;
-const PORT_END = 3200;
-const usedPorts = new Set<number>();
 
 const docker = new Docker();
 
-async function autoStartDevServer(
-  containerId: string,
-  sessionId: string
-): Promise<void> {
-  console.log(
-    `[polaris-docker] === AUTO START CALLED: ${sessionId} for container ${containerId} ===`
+function isContainerGoneError(err: unknown): boolean {
+  const e = err as { statusCode?: number; reason?: string; json?: { message?: string } };
+  const code = e?.statusCode ?? (e?.json as { statusCode?: number })?.statusCode;
+  return (
+    Number(code) === 409 ||
+    (typeof e?.reason === 'string' && e.reason.includes('container')) ||
+    (typeof e?.json?.message === 'string' && e.json.message.includes('not running'))
   );
+}
 
-  const container = docker.getContainer(containerId);
-  const baseCommand =
-    process.env.POLARIS_DEV_COMMAND ??
-    'npm run dev -- --host 0.0.0.0 --port 5173';
-  const fullCommand = `cd /workspace 2>/dev/null || true; nohup sh -c "npm install && ${baseCommand}" > /tmp/dev.log 2>&1 & echo $! > /tmp/dev.pid`;
-
-  console.log(
-    '[polaris-docker] auto-start dev server workingDir:',
-    '/workspace'
-  );
-  console.log(
-    '[polaris-docker] auto-start dev server command:',
-    fullCommand
-  );
-
+export async function pauseSession(sessionId: string): Promise<void> {
+  const info = registry.get(sessionId);
+  if (!info || info.status !== 'running') return;
   try {
-    const exec = await container.exec({
-      AttachStdout: true,
-      AttachStderr: true,
-      AttachStdin: false,
-      Tty: false,
-      User: 'sandbox',
-      WorkingDir: '/workspace',
-      Cmd: ['/bin/bash', '-lc', fullCommand],
-    });
-
-    const stream = await exec.start({ hijack: true, stdin: false });
-
-    if (!stream) {
-      console.error(
-        '[polaris-docker] auto-start exec stream not available',
-        { sessionId, containerId }
-      );
-      return;
+    await docker.getContainer(info.containerId).pause();
+    registry.updateStatus(sessionId, 'paused');
+    redis.incr('polaris:stats:pauses').catch(() => {});
+    console.log(`[polaris-docker] paused: ${sessionId}`);
+  } catch (err: unknown) {
+    if (isContainerGoneError(err)) {
+      // Container exited/removed — remove stale session so watchdog stops retrying
+      releasePort(info.port);
+      if (info.portVite != null) releasePort(info.portVite);
+      registry.delete(sessionId);
+      console.log(`[polaris-docker] removed stale session (container gone): ${sessionId}`);
+    } else {
+      console.error(`[polaris-docker] pause failed: ${sessionId}`, err);
     }
-
-    let output = '';
-    stream.on('data', (chunk: Buffer | string) => {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
-      output += text;
-    });
-
-    stream.on('end', async () => {
-      try {
-        const inspect = await exec.inspect();
-        const exitCode = (inspect as { ExitCode?: number }).ExitCode ?? null;
-        if (exitCode === 0) {
-          console.log(
-            '[polaris-docker] auto-start exec completed successfully',
-            { sessionId, containerId }
-          );
-        } else {
-          console.error(
-            '[polaris-docker] auto-start exec exited with non-zero code',
-            { sessionId, containerId, exitCode, output }
-          );
-        }
-      } catch (err) {
-        console.error(
-          '[polaris-docker] auto-start exec inspect failed',
-          {
-            sessionId,
-            containerId,
-            error: err instanceof Error ? err.message : String(err),
-          }
-        );
-      }
-    });
-
-    stream.on('error', (err: Error) => {
-      console.error(
-        '[polaris-docker] auto-start exec stream error',
-        { sessionId, containerId, error: err.message }
-      );
-    });
-  } catch (err) {
-    console.error(
-      '[polaris-docker] auto-start dev server failed',
-      {
-        sessionId,
-        containerId,
-        error: err instanceof Error ? err.message : String(err),
-      }
-    );
-    throw err;
   }
 }
 
+export async function unpauseSession(sessionId: string): Promise<void> {
+  const info = registry.get(sessionId);
+  if (!info || info.status !== 'paused') return;
+  try {
+    await docker.getContainer(info.containerId).unpause();
+    registry.updateStatus(sessionId, 'running');
+    registry.updateActivity(sessionId);
+    redis.incr('polaris:stats:unpauses').catch(() => {});
+    console.log(`[polaris-docker] unpaused: ${sessionId} in ~200ms`);
+  } catch (err: unknown) {
+    if (isContainerGoneError(err)) {
+      releasePort(info.port);
+      if (info.portVite != null) releasePort(info.portVite);
+      registry.delete(sessionId);
+      console.log(`[polaris-docker] removed stale session (container gone): ${sessionId}`);
+    } else {
+      console.error(`[polaris-docker] unpause failed: ${sessionId}`, err);
+    }
+  }
+}
+
+async function execAndWait(container: Docker.Container, cmd: string[]): Promise<void> {
+  const exec = await container.exec({
+    Cmd: cmd,
+    User: 'root',
+    AttachStdout: true,
+    AttachStderr: true,
+  });
+  const stream = await exec.start({ hijack: true, stdin: false });
+  await new Promise<void>((resolve) => {
+    stream.on('end', resolve);
+    stream.on('error', resolve);
+    setTimeout(resolve, 10_000);
+  });
+}
+
+async function copyFilesToContainer(
+  containerId: string,
+  files: { path: string; content: string }[]
+): Promise<void> {
+  const container = docker.getContainer(containerId);
+
+  // Collect all directories that need to exist (always include /workspace itself)
+  const dirs = new Set<string>(['/workspace']);
+  for (const file of files) {
+    const dir = path.dirname(file.path);
+    if (dir && dir !== '.') {
+      dirs.add(`/workspace/${dir}`);
+    }
+  }
+  // Create all directories in a single exec
+  await execAndWait(container, ['mkdir', '-p', ...dirs]);
+
+  for (const file of files) {
+    const base64 = Buffer.from(file.content).toString('base64');
+    await execAndWait(container, [
+      'sh', '-c', `echo '${base64}' | base64 -d > /workspace/${file.path}`,
+    ]);
+  }
+  console.log(`[polaris-docker] copied ${files.length} files to pooled container`);
+}
+
+/**
+ * Detect the project and write a startup script into the container.
+ * The script is executed by the terminal shell (pty.ts) so the user
+ * sees npm install / npm run dev output in their terminal.
+ */
+async function prepareAutoStart(
+  containerId: string,
+  sessionId: string,
+  workspacePath: string,
+  projectId: string
+): Promise<void> {
+  try {
+    const detection = await detectProject(workspacePath, projectId);
+    console.log(`[polaris-docker] detected: ${detection.framework} / ${detection.packageManager} / port ${detection.port}`);
+    registry.updateDetection(sessionId, detection);
+
+    const lines = ['#!/bin/sh', 'set -e', 'cd /workspace'];
+    if (detection.installCommand) {
+      lines.push(`echo "📦 Installing dependencies..."`, detection.installCommand);
+    }
+    lines.push(`echo "🚀 Starting dev server..."`, detection.devCommand);
+
+    const script = lines.join('\n') + '\n';
+    const container = docker.getContainer(containerId);
+    await execAndWait(container, ['sh', '-c', `cat > /workspace/.polaris-start.sh << 'POLARIS_EOF'\n${script}POLARIS_EOF`]);
+    await execAndWait(container, ['chmod', '+x', '/workspace/.polaris-start.sh']);
+    console.log(`[polaris-docker] startup script written for: ${sessionId}`);
+  } catch (err) {
+    console.error(`[polaris-docker] prepareAutoStart failed:`, err);
+  }
+}
+
+/**
+ * Remove all polaris-managed containers that are NOT tracked in the
+ * in-memory registry.  Uses the `polaris.managed=true` Docker label
+ * so it catches both session and pool containers regardless of name.
+ */
 export async function cleanupOrphanContainers(): Promise<void> {
   try {
-    const containers = await docker.listContainers({ all: true });
-    const polarisContainers = containers.filter((c) =>
-      c.Names?.some((n) => n.includes('polaris-'))
-    );
-    for (const c of polarisContainers) {
-      console.log(
-        `[polaris-docker] cleaning orphan: ${c.Id.slice(0, 12)}`
-      );
-      await docker.getContainer(c.Id).remove({ force: true });
+    const containers = await docker.listContainers({
+      all: true,
+      filters: { label: ['polaris.managed=true'] },
+    });
+
+    const knownIds = new Set<string>();
+    for (const [, info] of registry.getAll()) {
+      knownIds.add(info.containerId);
     }
-    console.log(
-      `[polaris-docker] cleaned ${polarisContainers.length} orphan containers`
-    );
+
+    let removed = 0;
+    for (const c of containers) {
+      if (knownIds.has(c.Id)) continue;
+      console.log(`[polaris-docker] cleaning orphan: ${c.Id.slice(0, 12)} (${c.Names?.join(', ')})`);
+      try {
+        await docker.getContainer(c.Id).remove({ force: true });
+        removed++;
+      } catch (err) {
+        console.error(`[polaris-docker] failed to remove orphan ${c.Id.slice(0, 12)}:`, err);
+      }
+    }
+    console.log(`[polaris-docker] cleaned ${removed} orphan containers (${containers.length} polaris-managed total)`);
   } catch (err) {
     console.error('[polaris-docker] cleanup error:', err);
   }
@@ -144,12 +189,17 @@ async function findContainerByName(name: string): Promise<string | null> {
   return found?.Id ?? null;
 }
 
-function getAvailablePort(skipPorts?: Set<number>): number {
-  for (let p = PORT_START; p <= PORT_END; p++) {
-    if (!usedPorts.has(p) && !skipPorts?.has(p)) return p;
+/** Return true if the container exists and is running (not exited). */
+async function isContainerRunning(containerId: string): Promise<boolean> {
+  try {
+    const container = docker.getContainer(containerId);
+    const inspect = await container.inspect();
+    return inspect.State?.Running === true;
+  } catch {
+    return false;
   }
-  throw new Error('[polaris-docker] no available port in range');
 }
+
 
 /** Get the host path mounted as /workspace in the container (from inspect). */
 async function getWorkspaceHostPath(containerId: string): Promise<string | null> {
@@ -157,15 +207,8 @@ async function getWorkspaceHostPath(containerId: string): Promise<string | null>
     const container = docker.getContainer(containerId);
     const inspect = await container.inspect();
     const mounts = (inspect as { Mounts?: { Destination: string; Source: string }[] }).Mounts ?? [];
-    // #region agent log
-    fetch('http://127.0.0.1:7449/ingest/3a1c7907-5e49-4774-9778-95d691a47c77', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'e2a0b7' }, body: JSON.stringify({ sessionId: 'e2a0b7', runId: 'workspace-debug', hypothesisId: 'H2_H5', location: 'manager.ts:getWorkspaceHostPath', message: 'inspect Mounts raw', data: { containerId, mountsCount: mounts.length, mounts: mounts.map(m => ({ Dest: m.Destination, Source: m.Source })), osTmpdir: os.tmpdir() }, timestamp: Date.now() }) }).catch(() => {});
-    // #endregion
     const workspaceMount = mounts.find((m) => m.Destination === '/workspace' || m.Destination === '/workspace/');
-    const source = workspaceMount?.Source ?? null;
-    // #region agent log
-    fetch('http://127.0.0.1:7449/ingest/3a1c7907-5e49-4774-9778-95d691a47c77', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'e2a0b7' }, body: JSON.stringify({ sessionId: 'e2a0b7', runId: 'workspace-debug', hypothesisId: 'H2_H5', location: 'manager.ts:getWorkspaceHostPath', message: 'resolved workspace source', data: { source, found: !!workspaceMount }, timestamp: Date.now() }) }).catch(() => {});
-    // #endregion
-    return source;
+    return workspaceMount?.Source ?? null;
   } catch {
     return null;
   }
@@ -186,15 +229,6 @@ async function writeFilesToHostPath(
     await writeFile(fullPath, file.content, 'utf-8');
     console.log('[polaris-docker] synced file:', fullPath);
   }
-  // #region agent log
-  try {
-    const listing = await readdir(hostPath, { withFileTypes: true });
-    const recursive = await Promise.all(listing.filter(d => d.isDirectory()).map(d => readdir(path.join(hostPath, d.name)).then(entries => ({ dir: d.name, entries }))));
-    fetch('http://127.0.0.1:7449/ingest/3a1c7907-5e49-4774-9778-95d691a47c77', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'e2a0b7' }, body: JSON.stringify({ sessionId: 'e2a0b7', runId: 'workspace-debug', hypothesisId: 'H3_H4', location: 'manager.ts:writeFilesToHostPath', message: 'host dir after write', data: { hostPath, topLevel: listing.map(d => d.name), subdirs: recursive }, timestamp: Date.now() }) }).catch(() => {});
-  } catch (e) {
-    fetch('http://127.0.0.1:7449/ingest/3a1c7907-5e49-4774-9778-95d691a47c77', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'e2a0b7' }, body: JSON.stringify({ sessionId: 'e2a0b7', runId: 'workspace-debug', hypothesisId: 'H4', location: 'manager.ts:writeFilesToHostPath', message: 'readdir failed after write', data: { hostPath, err: String(e) }, timestamp: Date.now() }) }).catch(() => {});
-  }
-  // #endregion
 }
 
 /** Write files into an existing session's workspace (for reuse path). Uses container mount when available. */
@@ -207,9 +241,6 @@ async function writeFilesToWorkspace(
   const hostPath = await getWorkspaceHostPath(containerId);
   const fallbackPath = path.join(os.tmpdir(), `polaris-${sessionId}`);
   const tempDir = hostPath ?? fallbackPath;
-  // #region agent log
-  fetch('http://127.0.0.1:7449/ingest/3a1c7907-5e49-4774-9778-95d691a47c77', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Debug-Session-Id': 'e2a0b7' }, body: JSON.stringify({ sessionId: 'e2a0b7', runId: 'workspace-debug', hypothesisId: 'H1_H2', location: 'manager.ts:writeFilesToWorkspace', message: 'path choice', data: { sessionId, containerId, hostPathFromInspect: hostPath, fallbackPath, chosen: tempDir, sameAsFallback: tempDir === fallbackPath }, timestamp: Date.now() }) }).catch(() => {});
-  // #endregion
   console.log('[polaris-docker] workspace host path for', sessionId, '->', tempDir, hostPath ? '(from container inspect)' : '(fallback)');
   await writeFilesToHostPath(tempDir, files);
 }
@@ -226,6 +257,7 @@ export interface CreateSessionResult {
   containerId: string;
   port: number;
   reused?: boolean;
+  wasPaused?: boolean;
 }
 
 export interface SessionStatus {
@@ -239,28 +271,22 @@ export class SessionManager {
 
     const existing = registry.findByProjectId(projectId, userId);
     if (existing) {
-      if (existing.info.status === 'running') {
-        registry.updateActivity(existing.sessionId);
-        await writeFilesToWorkspace(existing.sessionId, existing.info.containerId, files);
-        console.log('[polaris-docker] reusing running session:', existing.sessionId, 'projectId:', projectId);
+      if (existing.info.status === 'paused') {
+        await unpauseSession(existing.sessionId);
         return {
           sessionId: existing.sessionId,
           containerId: existing.info.containerId,
           port: existing.info.port,
           reused: true,
+          wasPaused: true,
         };
       }
-      if (existing.info.status === 'stopped') {
-        console.log('[polaris-docker] restarting stopped session:', existing.sessionId, 'projectId:', projectId);
-        await this.restartSession(existing.sessionId);
-        const info = registry.get(existing.sessionId);
-        if (info) await writeFilesToWorkspace(existing.sessionId, info.containerId, files);
-        const infoAfter = registry.get(existing.sessionId);
-        if (!infoAfter) throw new Error('[polaris-docker] session lost after restart');
+      if (existing.info.status === 'running') {
+        registry.updateActivity(existing.sessionId);
         return {
           sessionId: existing.sessionId,
-          containerId: infoAfter.containerId,
-          port: infoAfter.port,
+          containerId: existing.info.containerId,
+          port: existing.info.port,
           reused: true,
         };
       }
@@ -289,8 +315,8 @@ export class SessionManager {
 
     const port = getAvailablePort();
     const portVite = getAvailablePort(new Set([port]));
-    usedPorts.add(port);
-    usedPorts.add(portVite);
+    reservePort(port);
+    reservePort(portVite);
 
     const tempDir = path.join(os.tmpdir(), `polaris-${sessionId}`);
     await mkdir(tempDir, { recursive: true });
@@ -305,19 +331,63 @@ export class SessionManager {
       console.log('[polaris-docker] wrote file:', fullPath, '(path:', file.path, ')');
     }
 
+    const detection = await detectProject(tempDir, projectId);
+    const imageConfig = selectImage(detection.language);
+    const containerImage = imageConfig.image;
+    console.log(`[polaris-docker] using image: ${containerImage} for session: ${sessionId}`);
+
+    const pooled = await containerPool.acquire();
+    if (pooled) {
+      console.log(`[polaris-docker] using pooled container: ${pooled.containerId.slice(0, 12)} ports=${pooled.port},${pooled.portVite}`);
+      redis.incr('polaris:stats:pool-hits').catch(() => {});
+      // Release the pre-allocated ports; use the pool's ports instead
+      releasePort(port);
+      releasePort(portVite);
+
+      await copyFilesToContainer(pooled.containerId, files);
+
+      prepareAutoStart(pooled.containerId, sessionId, tempDir, projectId)
+        .catch(err => console.error('[polaris-docker] auto-start error:', err));
+
+      const now = new Date();
+      const info: SessionInfo = {
+        containerId: pooled.containerId,
+        port: pooled.port,
+        portVite: pooled.portVite,
+        userId,
+        projectId,
+        startedAt: now,
+        lastActivity: now,
+        status: 'running',
+      };
+      registry.set(sessionId, info);
+
+      return { sessionId, containerId: pooled.containerId, port: pooled.port, reused: false };
+    }
+
+    // Pool empty — create fresh container (slower path)
+    redis.incr('polaris:stats:cold-starts').catch(() => {});
     try {
       try {
-        await docker.getImage(SANDBOX_IMAGE).inspect();
-      } catch {
-        if (!SANDBOX_IMAGE.includes('/') && !SANDBOX_IMAGE.includes('.')) {
-          throw new Error(
-            `Image "${SANDBOX_IMAGE}" not found. Build it locally: docker build -t polaris-sandbox:latest -f Dockerfile.sandbox .`
-          );
-        }
-        const stream = await docker.pull(SANDBOX_IMAGE);
+        console.log(`[polaris-docker] pulling image: ${containerImage}`);
         await new Promise<void>((resolve, reject) => {
-          docker.modem.followProgress(stream, (err: Error | null) => (err ? reject(err) : resolve()));
+          docker.pull(containerImage, (err: Error, stream: NodeJS.ReadableStream) => {
+            if (err) return reject(err);
+            docker.modem.followProgress(stream, (err: Error | null) => {
+              if (err) return reject(err);
+              resolve();
+            });
+          });
         });
+        console.log(`[polaris-docker] image ready: ${containerImage}`);
+        try {
+          const imageInfo = await docker.getImage(containerImage).inspect();
+          const sizeMB = Math.round((imageInfo.Size ?? 0) / 1024 / 1024);
+          console.log(`[polaris-docker] image size: ${containerImage} = ${sizeMB}MB`);
+        } catch { /* size logging is best-effort */ }
+      } catch (err) {
+        console.error(`[polaris-docker] pull failed, using cached: ${containerImage}`, err);
+        // continue anyway — image might already be cached locally
       }
 
       const isPortConflict = (e: unknown) =>
@@ -325,30 +395,38 @@ export class SessionManager {
         String((e as Error)?.message ?? '').includes('Bind for');
 
       const triedPorts = new Set<number>();
-      const maxAttempts = Math.min(10, PORT_END - PORT_START + 1);
+      const maxAttempts = 10;
 
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const tryPort = attempt === 0 ? port : getAvailablePort(triedPorts);
         const tryPortVite =
           attempt === 0 ? portVite : getAvailablePort(new Set([...triedPorts, tryPort]));
         if (attempt > 0) {
-          usedPorts.add(tryPort);
-          usedPorts.add(tryPortVite);
+          reservePort(tryPort);
+          reservePort(tryPortVite);
         }
         triedPorts.add(tryPort);
         triedPorts.add(tryPortVite);
 
         let container: Awaited<ReturnType<Docker['createContainer']>> | null = null;
         try {
+          const isCustomSandbox =
+            containerImage === (process.env.SANDBOX_IMAGE ?? '');
           const containerConfig = {
-            Image: SANDBOX_IMAGE,
+            Image: containerImage,
             name: `polaris-${sessionId}`,
+            Labels: sessionLabels(sessionId),
             HostConfig: {
               Memory: 536870912,
               CpuPeriod: 100000,
               CpuQuota: 50000,
               NetworkMode: 'bridge',
-              Binds: [`${tempDir}:/workspace:rw`],
+              Binds: [
+                `${tempDir}:/workspace:rw`,
+                `polaris-npm-cache:/root/.npm:rw`,
+                `polaris-pip-cache:/root/.cache/pip:rw`,
+                `polaris-go-cache:/root/go/pkg/mod:rw`,
+              ],
               PortBindings: {
                 '3000/tcp': [{ HostPort: tryPort.toString() }],
                 '5173/tcp': [{ HostPort: tryPortVite.toString() }],
@@ -356,7 +434,8 @@ export class SessionManager {
             },
             ExposedPorts: { '3000/tcp': {}, '5173/tcp': {} },
             WorkingDir: '/workspace',
-            User: 'sandbox',
+            User: isCustomSandbox ? 'sandbox' : 'root',
+            Cmd: ['sleep', 'infinity'],
           };
           console.log('[polaris-docker] container config before create:', JSON.stringify(containerConfig, null, 2));
 
@@ -369,13 +448,8 @@ export class SessionManager {
             '[polaris-docker] container started, launching auto-start:',
             sessionId
           );
-          autoStartDevServer(containerId, sessionId).catch((err: unknown) => {
-            console.error(
-              '[polaris-docker] TOP LEVEL auto-start error:',
-              sessionId,
-              err
-            );
-          });
+          prepareAutoStart(containerId, sessionId, tempDir, params.projectId)
+            .catch(err => console.error("[polaris-docker] auto-start error:", err));
 
           const now = new Date();
           const info: SessionInfo = {
@@ -395,8 +469,8 @@ export class SessionManager {
           if (container) {
             await container.remove({ force: true }).catch(() => {});
           }
-          usedPorts.delete(tryPort);
-          usedPorts.delete(tryPortVite);
+          releasePort(tryPort);
+          releasePort(tryPortVite);
           if (attempt < maxAttempts - 1 && isPortConflict(err)) {
             console.log('[polaris-docker] port', tryPort, 'or', tryPortVite, 'in use, retrying');
             continue;
@@ -407,8 +481,8 @@ export class SessionManager {
 
       throw new Error('[polaris-docker] no available port in range after retries');
     } catch (err) {
-    usedPorts.delete(port);
-    usedPorts.delete(portVite);
+    releasePort(port);
+    releasePort(portVite);
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
@@ -423,16 +497,20 @@ export class SessionManager {
       '[polaris-docker] container started, launching auto-start (restart):',
       sessionId
     );
-    autoStartDevServer(info.containerId, sessionId).catch((err: unknown) => {
-      console.error(
-        '[polaris-docker] TOP LEVEL auto-start error (restart):',
-        sessionId,
-        err
-      );
-    });
+    const workspacePath = path.join(os.tmpdir(), `polaris-${sessionId}`);
+    prepareAutoStart(info.containerId, sessionId, workspacePath, info.projectId)
+      .catch(err => console.error("[polaris-docker] auto-start error:", err));
     registry.updateStatus(sessionId, 'running');
     registry.updateActivity(sessionId);
     console.log('[polaris-docker] restarted container', { sessionId });
+  }
+
+  async pauseSession(sessionId: string): Promise<void> {
+    await pauseSession(sessionId);
+  }
+
+  async unpauseSession(sessionId: string): Promise<void> {
+    await unpauseSession(sessionId);
   }
 
   /** Stop container only (idle). Keeps container and tempDir; use stopSession for full teardown. */
@@ -465,8 +543,8 @@ export class SessionManager {
     const tempDir = path.join(os.tmpdir(), `polaris-${sessionId}`);
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 
-    usedPorts.delete(info.port);
-    if (info.portVite != null) usedPorts.delete(info.portVite);
+    releasePort(info.port);
+    if (info.portVite != null) releasePort(info.portVite);
     registry.delete(sessionId);
     console.log('[polaris-docker] session stopped', { sessionId });
   }
@@ -499,8 +577,8 @@ export class SessionManager {
       if (!inspect.State.Running) {
         await container.start();
       }
-      if (port !== null) usedPorts.add(port);
-      if (portVite != null) usedPorts.add(portVite);
+      if (port !== null) reservePort(port);
+      if (portVite != null) reservePort(portVite);
       const now = new Date();
       const info: SessionInfo = {
         containerId,
