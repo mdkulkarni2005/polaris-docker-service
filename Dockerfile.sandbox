@@ -2,15 +2,24 @@
 # Build: docker build -t polaris-sandbox:latest -f Dockerfile.sandbox .
 FROM node:20-alpine
 
-RUN apk add --no-cache python3 py3-pip git bash curl wget make g++ \
-  && npm install -g typescript ts-node nodemon \
-  && addgroup -S sandbox && adduser -S sandbox -G sandbox -u 1001
+RUN apk add --no-cache python3 pip git bash curl make g++
 
-WORKDIR /workspace
-RUN chown -R sandbox:sandbox /workspace
+# Pre-install common packages globally as a cached Docker layer
+# First npm install for these packages = instant (already in image)
+RUN npm install -g \
+  typescript \
+  ts-node \
+  vite \
+  @vitejs/plugin-react \
+  next \
+  react \
+  react-dom \
+  express \
+  serve \
+  nodemon
 
-EXPOSE 3000 5173
+RUN adduser -D -u 1001 sandbox
 USER sandbox
-# Keep container alive; terminal is attached via docker exec in pty.ts
-# tail -f /dev/null works on all base images (Alpine/Busybox)
-CMD ["tail", "-f", "/dev/null"]
+WORKDIR /workspace
+EXPOSE 3000 5173 8000
+CMD ["/bin/bash"]

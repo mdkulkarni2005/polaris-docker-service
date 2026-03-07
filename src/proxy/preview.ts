@@ -3,6 +3,7 @@ import { createProxyMiddleware } from 'http-proxy-middleware';
 import Docker from 'dockerode';
 import { registry } from '../session/registry';
 import { isInternalKeyInvalid } from '../security/auth';
+import { unpauseSession } from '../session/manager';
 
 const PROXY_TIMEOUT_MS = 8000;
 const PORT_PROBE_TIMEOUT_MS = 1000;
@@ -29,47 +30,84 @@ function sendPreviewNotReady(res: Response): void {
   res.status(502).setHeader('Content-Type', 'text/html; charset=utf-8').send(PREVIEW_NOT_READY_HTML);
 }
 
-const PREVIEW_CONTAINER_PORTS = [5173, 3000, 8000, 4200, 8080] as const;
+const PORT_PRIORITY = [5173, 3000, 3001, 3002, 8000, 4200, 8080];
 
 async function findPreviewTargetPort(containerId: string, sessionId: string): Promise<number | null> {
   try {
     const container = docker.getContainer(containerId);
     const inspect = await container.inspect();
-    const ports = inspect.NetworkSettings?.Ports ?? {};
+    const portBindings = inspect.NetworkSettings?.Ports ?? {};
 
-    for (const containerPort of PREVIEW_CONTAINER_PORTS) {
-      const key = `${containerPort}/tcp`;
-      const binding = ports[key]?.[0]?.HostPort;
-      if (!binding) continue;
+    const candidates: { containerPort: number; hostPort: number }[] = [];
+    for (const [key, bindings] of Object.entries(portBindings)) {
+      if (!bindings?.length) continue;
+      const containerPort = parseInt(key, 10);
+      const hostPort = parseInt(bindings[0].HostPort ?? '', 10);
+      if (Number.isFinite(containerPort) && Number.isFinite(hostPort)) {
+        candidates.push({ containerPort, hostPort });
+      }
+    }
 
-      const hostPort = parseInt(binding, 10);
-      if (!Number.isFinite(hostPort)) continue;
+    candidates.sort((a, b) => {
+      const ai = PORT_PRIORITY.indexOf(a.containerPort);
+      const bi = PORT_PRIORITY.indexOf(b.containerPort);
+      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    });
 
+    for (const { containerPort, hostPort } of candidates) {
       try {
         const resp = await fetch(`http://127.0.0.1:${hostPort}/`, {
           method: 'GET',
           signal: AbortSignal.timeout(PORT_PROBE_TIMEOUT_MS),
         });
         if (resp.status < 500) {
-          console.log(
-            '[polaris-docker] preview port selected:',
-            sessionId,
-            'containerPort',
-            containerPort,
-            'hostPort',
-            hostPort
-          );
+          console.log('[polaris-docker] preview port selected:', sessionId, 'containerPort', containerPort, 'hostPort', hostPort);
           return hostPort;
         }
       } catch {
-        // Ignore and try next candidate port
+        // port not responding, try next
       }
     }
+
+    await logContainerListeningPorts(container, sessionId);
   } catch (err) {
     console.log('[polaris-docker] preview inspect error:', sessionId, containerId, err);
   }
 
   return null;
+}
+
+async function logContainerListeningPorts(container: Docker.Container, sessionId: string): Promise<void> {
+  try {
+    const exec = await container.exec({
+      Cmd: ['sh', '-c', "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || echo 'no tool'"],
+      AttachStdout: true,
+      AttachStderr: true,
+      User: 'root',
+    });
+    const stream = await exec.start({ hijack: true, stdin: false });
+    let output = '';
+    stream.on('data', (chunk: Buffer) => { output += chunk.toString(); });
+    await new Promise<void>(resolve => {
+      stream.on('end', resolve);
+      stream.on('error', resolve);
+      setTimeout(resolve, 3000);
+    });
+
+    const listening: number[] = [];
+    const portRe = /(?:\*|0\.0\.0\.0|::):(\d+)/g;
+    let m;
+    while ((m = portRe.exec(output)) !== null) {
+      const p = parseInt(m[1], 10);
+      if (p > 0 && p < 65536) listening.push(p);
+    }
+
+    if (listening.length) {
+      console.log(`[polaris-docker] container ${sessionId} has listeners on ports: ${[...new Set(listening)].join(', ')} (none mapped to host)`);
+    }
+  } catch {
+    // diagnostic only — ignore errors
+  }
 }
 
 export function createPreviewRouter(): Router {
@@ -93,6 +131,12 @@ export function createPreviewRouter(): Router {
       return;
     }
 
+    if (session.status === 'paused') {
+      console.log(`[polaris-docker] auto-unpausing for request: ${sessionId}`);
+      await unpauseSession(sessionId);
+      await new Promise(r => setTimeout(r, 300));
+    }
+
     registry.updateActivity(sessionId);
     console.log('[polaris-docker] preview request:', sessionId, req.method, req.path);
 
@@ -111,7 +155,13 @@ export function createPreviewRouter(): Router {
       proxyTimeout: PROXY_TIMEOUT_MS,
       timeout: PROXY_TIMEOUT_MS,
       on: {
-        proxyRes(proxyRes) {
+        proxyRes(proxyRes, req) {
+          const STATIC_RE = /\.(js|css|png|svg|ico|woff|woff2|ttf|jpg|jpeg|gif|webp)(\?|$)/;
+          if (STATIC_RE.test(req.url ?? '')) {
+            proxyRes.headers['cache-control'] = 'public, max-age=31536000, immutable';
+          } else {
+            proxyRes.headers['cache-control'] = 'no-cache, no-store, must-revalidate';
+          }
           if (proxyRes.statusCode && proxyRes.statusCode < 500) {
             console.log('[polaris-docker] preview proxy OK:', sessionId, '-> port', targetPort);
           }

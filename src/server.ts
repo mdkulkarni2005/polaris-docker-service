@@ -1,17 +1,34 @@
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'http';
+import path from 'path';
 import ws from 'ws';
 import cors from 'cors';
 import Docker from 'dockerode';
-import { cleanupOrphanContainers, sessionManager } from './session/manager';
+import { sessionManager, cleanupOrphanContainers } from './session/manager';
 import { registry } from './session/registry';
+import { syncPortsFromDocker } from './ports';
 import { hybridAuth, isInternalKeyInvalid } from './security/auth';
+import { checkRateLimit } from './security/rateLimiter';
 import { startWatchdog, stopWatchdog, getStats } from './security/limits';
 import { attachTerminal } from './terminal/pty';
 import { createPreviewRouter } from './proxy/preview';
+import { containerPool } from './pool/containerPool';
 
 const docker = new Docker();
+
+async function ensureCacheVolumes(): Promise<void> {
+  const volumes = ['polaris-npm-cache', 'polaris-pip-cache', 'polaris-go-cache'];
+  for (const name of volumes) {
+    try {
+      await docker.getVolume(name).inspect();
+      console.log(`[polaris-docker] cache volume exists: ${name}`);
+    } catch {
+      await docker.createVolume({ Name: name });
+      console.log(`[polaris-docker] created cache volume: ${name}`);
+    }
+  }
+}
 
 const PORT = Number(process.env.PORT) || 4000;
 
@@ -68,6 +85,66 @@ interface StopSessionBody {
   sessionId: string;
 }
 
+interface FileUpdateBody {
+  sessionId: string;
+  path: string;
+  content: string;
+}
+
+interface FilesSyncBody {
+  sessionId: string;
+  files: { path: string; content: string }[];
+}
+
+/** Sync a single file into a session container via docker exec. Caller must ensure session exists. */
+async function syncFileToContainer(
+  sessionId: string,
+  filePath: string,
+  content: string
+): Promise<void> {
+  const info = registry.get(sessionId);
+  if (!info) throw new Error('Session not found');
+  const container = docker.getContainer(info.containerId);
+
+  const dir = path.dirname(filePath);
+  if (dir && dir !== '.') {
+    const mkdirExec = await container.exec({
+      Cmd: ['mkdir', '-p', `/workspace/${dir}`],
+      AttachStdout: false,
+      AttachStderr: false,
+      User: 'root',
+    });
+    const mkdirStream = await mkdirExec.start({ hijack: true, stdin: false });
+    await new Promise<void>((resolve, reject) => {
+      mkdirStream.on('end', resolve);
+      mkdirStream.on('error', reject);
+    });
+  }
+
+  const base64Content = Buffer.from(content).toString('base64');
+  const writeExec = await container.exec({
+    Cmd: [
+      'sh',
+      '-c',
+      `echo '${base64Content}' | base64 -d > "/workspace/$1"`,
+      'sh',
+      filePath,
+    ],
+    AttachStdout: true,
+    AttachStderr: true,
+    User: 'root',
+    WorkingDir: '/workspace',
+  });
+  const writeStream = await writeExec.start({ hijack: true, stdin: false });
+  await new Promise<void>((resolve, reject) => {
+    writeStream.on('end', resolve);
+    writeStream.on('error', reject);
+  });
+
+  console.log(`[polaris-docker] file synced: ${sessionId} → ${filePath}`);
+  registry.updateActivity(sessionId);
+}
+
 app.post('/session/start', hybridAuth, async (req, res) => {
   try {
     const body = req.body as StartSessionBody;
@@ -76,6 +153,16 @@ app.post('/session/start', hybridAuth, async (req, res) => {
       res.status(400).json({ error: 'Missing or invalid sessionId, projectId, userId, or files' });
       return;
     }
+
+    const rateCheck = await checkRateLimit(userId);
+    if (!rateCheck.allowed) {
+      res.status(429).json({
+        error: rateCheck.reason,
+        retryAfter: rateCheck.retryAfter,
+      });
+      return;
+    }
+
     const result = await sessionManager.createSession({ sessionId, projectId, userId, files });
     const effectiveSessionId = result.sessionId;
     const host = req.headers.host ?? `localhost:${PORT}`;
@@ -128,13 +215,67 @@ app.post('/session/stop', hybridAuth, async (req, res) => {
   }
 });
 
+app.post('/session/file/update', hybridAuth, async (req, res) => {
+  try {
+    const body = req.body as FileUpdateBody;
+    const { sessionId, path: filePath, content } = body;
+    if (sessionId == null || filePath == null || content == null) {
+      res.status(400).json({ error: 'Missing sessionId, path, or content' });
+      return;
+    }
+    if (!registry.has(sessionId)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    await syncFileToContainer(sessionId, filePath, content);
+    res.status(200).json({ success: true, path: filePath });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[polaris-docker] /session/file/update error', { err });
+    res.status(500).json({ error: message });
+  }
+});
+
+app.post('/session/files/sync', hybridAuth, async (req, res) => {
+  try {
+    const body = req.body as FilesSyncBody;
+    const { sessionId, files } = body;
+    if (sessionId == null || !Array.isArray(files)) {
+      res.status(400).json({ error: 'Missing sessionId or files array' });
+      return;
+    }
+    if (!registry.has(sessionId)) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    let synced = 0;
+    for (const file of files) {
+      if (file.path == null || file.content == null) continue;
+      await syncFileToContainer(sessionId, file.path, file.content);
+      synced += 1;
+    }
+    res.status(200).json({ success: true, synced });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[polaris-docker] /session/files/sync error', { err });
+    res.status(500).json({ error: message });
+  }
+});
+
 app.get('/session/status', hybridAuth, (req, res) => {
   const sessionId = req.query.sessionId as string | undefined;
   if (!sessionId) {
     res.status(400).json({ error: 'Missing sessionId query' });
     return;
   }
-  res.status(200).json(sessionManager.getStatus(sessionId));
+  const status = sessionManager.getStatus(sessionId);
+  const detection = registry.get(sessionId)?.detection;
+  res.status(200).json({
+    running: status.running,
+    ...(status.port !== undefined && { port: status.port }),
+    ...(detection !== undefined && { detection }),
+    devServerReady: undefined as boolean | undefined,
+  });
 });
 
 app.get('/session/devlog', hybridAuth, async (req, res) => {
@@ -160,9 +301,9 @@ app.get('/session/devlog', hybridAuth, async (req, res) => {
         AttachStderr: true,
         AttachStdin: false,
         Tty: false,
-        User: 'sandbox',
+        User: 'root',
         WorkingDir: '/workspace',
-        Cmd: ['/bin/bash', '-lc', cmd],
+        Cmd: ['/bin/sh', '-c', cmd],
       });
       const stream = await exec.start({ hijack: true, stdin: false });
       if (!stream) {
@@ -226,7 +367,15 @@ app.get('/session/devlog', hybridAuth, async (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-  res.status(200).json({ status: 'ok', ...getStats(), uptime: process.uptime() });
+  res.status(200).json({
+    status: 'ok',
+    totalSessions: registry.count(),
+    running: registry.countByStatus('running'),
+    paused: registry.countByStatus('paused'),
+    stopped: registry.countByStatus('stopped'),
+    poolSize: containerPool.size(),
+    uptime: process.uptime(),
+  });
 });
 
 app.get('/sessions', hybridAuth, (_req, res) => {
@@ -244,10 +393,20 @@ app.get('/sessions', hybridAuth, (_req, res) => {
 });
 
 server.listen(PORT, async () => {
+  await ensureCacheVolumes();
+
+  // Discover host ports already bound by Docker so the allocator skips them.
+  await syncPortsFromDocker();
+
+  // Restore known sessions from Redis, then kill any Docker containers
+  // that are polaris-managed but not in the registry (leaked/orphaned).
+  await registry.restoreFromRedis();
   await cleanupOrphanContainers();
+  await containerPool.initialize();
+
   const watchdogHandle = startWatchdog();
-  console.log('[polaris-docker] running on', PORT);
-  console.log('[polaris-docker] watchdog started');
+
+  console.log(`[polaris-docker] running on ${PORT}`);
 
   process.on('SIGTERM', () => {
     stopWatchdog(watchdogHandle);
